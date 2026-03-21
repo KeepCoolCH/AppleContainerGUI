@@ -58,14 +58,14 @@ If the CLI is missing, the app offers to install it via Homebrew and shows the l
 
 ## 🔧 Installation
 
-> 🧱 Requires macOS 26 Tahoe or newer
-
 [![Download AppleContainerGUI](https://img.shields.io/badge/Download-AppleContainerGUI-blue)](https://github.com/KeepCoolCH/AppleContainerGUI/releases/tag/V.1.0)
 
 1. Run **AppleContainerGUI.app**
 2. Install **Homebrew** if needed (the app shows the correct prompt)
 3. Install the Apple Container CLI: `brew install container` (automatic install via the app)
 4. Install the kernel (automatic install via the app)
+
+> 🧱 Requires macOS 26 Tahoe or newer
 
 ---
 
