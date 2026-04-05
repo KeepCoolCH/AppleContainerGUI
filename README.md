@@ -1,6 +1,6 @@
 ![Hero Screenshot](https://online.kevintobler.ch/projectimages/AppleContainerGUI-Banner.jpg)
 
-# AppleContainerGUI
+# AppleContainerGUI for macOS
 
 **AppleContainerGUI** is a native macOS SwiftUI front-end for the `container` CLI (Apple Container). It provides an organized, visual way to manage containers, images, volumes, networks, snapshots and logs.
 
