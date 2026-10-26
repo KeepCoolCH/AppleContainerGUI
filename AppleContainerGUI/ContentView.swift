@@ -12,7 +12,7 @@ struct ContentView: View {
             HStack(spacing: 8) {
                 Image(systemName: "shippingbox")
                     .font(.title2)
-                Text("AppleContainerGUI")
+                Text(AppleContainerGUIApp.displayTitle)
                     .font(.headline)
                 Text("Developed by Kevin Tobler - www.kevintobler.ch")
                     .font(.caption)
@@ -22,25 +22,30 @@ struct ContentView: View {
             .padding(.top, 8)
             .padding(.bottom, 8)
 
+            RuntimeSetupView()
+                .padding(.horizontal, 16)
+
             HStack {
                 Button {
                     Task { await viewModel.startAllServices() }
                 } label: {
                     Label("Start Container System", systemImage: "play.circle")
                 }
-                .disabled(viewModel.isServiceRunning)
+                .disabled(viewModel.isServiceRunning || RuntimeInstaller.shared.isInstalling || !RuntimeInstaller.shared.isInstalled)
 
                 Button {
                     Task { await viewModel.stopAllServices() }
                 } label: {
                     Label("Stop Container System", systemImage: "stop.circle")
                 }
-                .disabled(!viewModel.isServiceRunning)
+                .disabled(!viewModel.isServiceRunning || RuntimeInstaller.shared.isInstalling)
                 Spacer()
             }
             .padding(.horizontal, 16)
 
             TabView {
+                DockerSocketView()
+                    .tabItem { Label("Docker API", systemImage: "point.3.connected.trianglepath.dotted") }
                 ContainersView(viewModel: viewModel)
                     .tabItem { Label("Containers", systemImage: "shippingbox") }
                 ImagesView(viewModel: viewModel)
@@ -55,52 +60,20 @@ struct ContentView: View {
                     .tabItem { Label("Command", systemImage: "terminal") }
                 SnapshotsView(viewModel: viewModel)
                     .tabItem { Label("Snapshots", systemImage: "camera") }
+                ContainerSettingsView()
+                    .tabItem { Label("Settings", systemImage: "gearshape") }
                 LogsView(viewModel: viewModel)
                     .tabItem { Label("Logs", systemImage: "list.bullet.rectangle") }
             }
+            .disabled(RuntimeInstaller.shared.isInstalling)
         }
         .frame(minWidth: 1180, minHeight: 700)
         .onAppear { viewModel.startup() }
-        .alert("Apple Container Not Found", isPresented: Binding(
-            get: { viewModel.showInstallPrompt },
-            set: { viewModel.showInstallPrompt = $0 }
-        )) {
-            Button {
-                Task { await viewModel.installContainerViaHomebrew() }
-            } label: {
-                Label("Install via Homebrew", systemImage: "wrench.and.screwdriver")
-            }
-            Button(role: .cancel) {} label: {
-                Label("Cancel", systemImage: "xmark")
-            }
-        } message: {
-            Text("Install Apple Container via Homebrew? If Homebrew is missing, you will get the installation instructions.")
+        .task { await viewModel.observeResources() }
+        .onChange(of: RuntimeInstaller.shared.isInstalling) { _, installing in
+            if !installing, RuntimeInstaller.shared.isInstalled { Task { await viewModel.refreshAll() } }
         }
-        .alert("Homebrew Missing", isPresented: Binding(
-            get: { viewModel.showHomebrewPrompt },
-            set: { viewModel.showHomebrewPrompt = $0 }
-        )) {
-            Button {
-                copyToPasteboard(viewModel.homebrewInstallCommand)
-                openTerminal()
-            } label: {
-                Label("Copy Install Command", systemImage: "doc.on.doc")
-            }
-            Button(role: .cancel) {} label: {
-                Label("Cancel", systemImage: "xmark")
-            }
-        } message: {
-            Text("Homebrew is not installed. The install command is ready and can be run in Terminal.")
-        }
-        .sheet(isPresented: Binding(
-            get: { viewModel.showInstallStatus },
-            set: { viewModel.showInstallStatus = $0 }
-        )) {
-            InstallStatusSheet(viewModel: viewModel, isPresented: Binding(
-                get: { viewModel.showInstallStatus },
-                set: { viewModel.showInstallStatus = $0 }
-            ))
-        }
+
     }
 
     private func copyToPasteboard(_ text: String) {
@@ -113,64 +86,11 @@ struct ContentView: View {
     }
 }
 
-struct InstallStatusSheet: View {
-    @Bindable var viewModel: ContainerViewModel
-    @Binding var isPresented: Bool
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("Installation In Progress")
-                .font(.headline)
-            if viewModel.isInstallingContainer {
-                ProgressView()
-            }
-            if !viewModel.lastCommand.isEmpty {
-                Text("Last Command")
-                    .font(.headline)
-                Text(viewModel.lastCommand)
-                    .font(.caption)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .textSelection(.enabled)
-            }
-            if !viewModel.lastOutput.isEmpty {
-                Text("Output")
-                    .font(.headline)
-                ScrollView {
-                    Text(viewModel.lastOutput)
-                        .font(.caption)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .textSelection(.enabled)
-                }
-                .frame(maxHeight: 200)
-            }
-            if !viewModel.lastError.isEmpty {
-                Text("Error")
-                    .font(.headline)
-                ScrollView {
-                    Text(viewModel.lastError)
-                        .font(.caption)
-                        .foregroundStyle(.red)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .textSelection(.enabled)
-                }
-                .frame(maxHeight: 200)
-            }
-        }
-        .padding(16)
-        .frame(minWidth: 640, minHeight: 420)
-        .onChange(of: viewModel.isInstallingContainer) { _, newValue in
-            if !newValue {
-                isPresented = false
-            }
-        }
-    }
-}
 
 struct ContainersView: View {
     @Bindable var viewModel: ContainerViewModel
     @State private var selection: ContainerListItem.ID?
     @State private var isInspectorPresented = false
-    @State private var isResourcesPresented = false
 
     var body: some View {
         VStack(spacing: 12) {
@@ -209,16 +129,11 @@ struct ContainersView: View {
                     } label: {
                         Label("Delete Container", systemImage: "trash")
                     }
-                    .disabled(selectedContainer == nil)
+                    .help("Stops a running container before removing it. Data volumes are retained.")
+                    .disabled(selectedContainer == nil || viewModel.isDeletingResource)
                     Spacer()
                 }
                 HStack {
-                    Button {
-                        isResourcesPresented = true
-                    } label: {
-                        Label("Edit Resources", systemImage: "slider.horizontal.3")
-                    }
-                        .disabled(selectedContainer == nil)
                     Button {
                         if let container = selectedContainer {
                             Task { await viewModel.updateContainerImage(container) }
@@ -295,15 +210,7 @@ struct ContainersView: View {
                 InspectView(title: "Container \(container.name)", json: container.raw.prettyJSON())
             }
         }
-        .sheet(isPresented: $isResourcesPresented) {
-            if let container = selectedContainer {
-                EditResourcesSheet(
-                    viewModel: viewModel,
-                    container: container,
-                    isPresented: $isResourcesPresented
-                )
-            }
-        }
+
     }
 
     private var selectedContainer: ContainerListItem? {
@@ -590,62 +497,6 @@ final class NetworkThroughputMonitor: NSObject, @unchecked Sendable {
     }
 }
 
-struct EditResourcesSheet: View {
-    @Bindable var viewModel: ContainerViewModel
-    let container: ContainerListItem
-    @Binding var isPresented: Bool
-
-    @State private var cpus: String = ""
-    @State private var memory: String = ""
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("Edit Resources")
-                .font(.headline)
-            Text(container.name)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-            Form {
-                Section("Resources") {
-                    VStack(spacing: 8) {
-                        TextField("CPUs (e.g. 2, 4, 8)", text: $cpus)
-                        TextField("Memory (e.g. 2g, 4096m)", text: $memory)
-                    }
-                }
-                Section("Info") {
-                    Text("This action stops, deletes, and recreates the container with the new resources.")
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-
-            HStack {
-                Button {
-                    isPresented = false
-                } label: {
-                    Label("Cancel", systemImage: "xmark")
-                }
-                Spacer()
-                Button {
-                    Task { await viewModel.recreateContainerWithResources(container, cpus: cpus, memory: memory) }
-                    isPresented = false
-                } label: {
-                    Label("Apply", systemImage: "checkmark")
-                }
-            }
-        }
-        .padding(16)
-        .frame(minWidth: 640, minHeight: 360)
-        .onAppear {
-            let current = viewModel.currentResources(for: container)
-            cpus = current.cpus
-            memory = current.memory
-        }
-    }
-}
-
 struct ImagesView: View {
     @Bindable var viewModel: ContainerViewModel
     @State private var selection: ImageListItem.ID?
@@ -663,16 +514,12 @@ struct ImagesView: View {
                 }
                 Button {
                     if let image = selectedImage {
-                        if viewModel.isImageInUse(image) {
-                            viewModel.reportImageInUseError(image)
-                        } else {
-                            Task { await viewModel.deleteImage(image) }
-                        }
+                        Task { await viewModel.deleteImage(image) }
                     }
                 } label: {
                     Label("Delete", systemImage: "trash")
                 }
-                .disabled(selectedImage == nil)
+                .disabled(selectedImage == nil || viewModel.isDeletingResource)
                 Button {
                     if let image = selectedImage {
                         runImage = image
@@ -701,7 +548,7 @@ struct ImagesView: View {
             Table(viewModel.images, selection: $selection) {
                 TableColumn("Reference") { Text($0.reference) }
                 TableColumn("Size") { Text($0.size) }
-                TableColumn("Digest") { Text($0.id).font(.caption) }
+                TableColumn("Digest") { Text($0.digest).font(.caption) }
             }
 
             ConsolePanel(viewModel: viewModel)
@@ -756,8 +603,8 @@ struct RunImageSheet: View {
                     TextField("Container name (optional)", text: $name)
                     Toggle("Run in background (detached)", isOn: $detach)
                     VStack(spacing: 8) {
-                        TextField("CPUs (e.g. 2, 4, 8)", text: $cpus)
-                        TextField("Memory (e.g. 2g, 4096m)", text: $memory)
+                        TextField("CPUs (empty = Settings default)", text: $cpus)
+                        TextField("Memory (empty = Settings default)", text: $memory)
                     }
                     Toggle("Override entrypoint (disable chown) if container doesn't start", isOn: $overrideEntrypoint)
                         .onChange(of: overrideEntrypoint) { _, newValue in
@@ -932,13 +779,13 @@ struct VolumesView: View {
                 } label: {
                     Label("Delete", systemImage: "trash")
                 }
-                .disabled(selectedVolume == nil)
+                .disabled(selectedVolume == nil || viewModel.isDeletingResource)
                 Button {
                     if let volume = selectedVolume {
                         Task { await viewModel.openVolumeInFinder(volume) }
                     }
                 } label: {
-                    Label("Open in Finder", systemImage: "folder")
+                    Label("Show Storage in Finder", systemImage: "folder")
                 }
                 .disabled(selectedVolume == nil)
                 Button {
@@ -1127,7 +974,7 @@ struct NetworksView: View {
                 } label: {
                     Label("Delete", systemImage: "trash")
                 }
-                .disabled(selectedNetwork == nil)
+                .disabled(selectedNetwork == nil || viewModel.isDeletingResource)
                 Button {
                     isInspectorPresented = true
                 } label: {

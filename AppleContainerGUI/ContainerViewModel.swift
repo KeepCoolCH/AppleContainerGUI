@@ -46,26 +46,27 @@ extension ContainerListItem {
             let container = mapping.containerPort.isEmpty ? "?" : mapping.containerPort
             let label = "\(host):\(container)"
             guard let url = URL(string: "http://localhost:\(host)") else { return nil }
-            return ContainerPortLink(id: UUID(), label: label, url: url)
+            return ContainerPortLink(id: mapping.id, label: label, url: url)
         }
     }
 }
 
 struct ContainerPortMapping: Identifiable, Hashable {
-    let id: UUID
+    let id: String
     let hostPort: String
     let containerPort: String
     let hostAddress: String
 }
 
 struct ContainerPortLink: Identifiable, Hashable {
-    let id: UUID
+    let id: String
     let label: String
     let url: URL
 }
 
 struct ImageListItem: Identifiable, Hashable {
-    let id: String
+    var id: String { reference.isEmpty ? digest : reference }
+    let digest: String
     let reference: String
     let size: String
     let raw: [String: JSONValue]
@@ -209,10 +210,6 @@ final class ContainerViewModel {
     var dockerHubResults: [DockerHubRepository] = []
     var dockerHubError: String = ""
     var dockerHubInfo: String = ""
-    var showInstallPrompt: Bool = false
-    var showHomebrewPrompt: Bool = false
-    var isInstallingContainer: Bool = false
-    var showInstallStatus: Bool = false
     var selectedRegistry: RegistryOption = .dockerHub
     var customRegistryHost: String = ""
     var isPullingImage: Bool = false
@@ -235,16 +232,11 @@ final class ContainerViewModel {
         }
     }
 
-    var homebrewInstallCommand: String {
-        "/bin/bash -c \"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
-    }
-
     func startup() {
         Task(priority: .utility) {
             await Task.yield()
             try? await Task.sleep(for: .milliseconds(150))
             if !isContainerAvailable() {
-                showInstallPrompt = true
                 return
             }
             Task(priority: .utility) {
@@ -274,6 +266,26 @@ final class ContainerViewModel {
         }
     }
 
+    @ObservationIgnored private var refreshingResources: Set<String> = []
+    @ObservationIgnored private var isLiveRefreshing = false
+
+    func observeResources() async {
+        while !Task.isCancelled {
+            do { try await Task.sleep(for: .seconds(3)) } catch { return }
+            guard !RuntimeInstaller.shared.isInstalling,
+                  RuntimeInstaller.shared.isInstalled,
+                  DockerSocketService.shared.isRunning,
+                  !isLoading, !isDeletingResource, !isRunningCommand,
+                  !isPullingImage, refreshingResources.isEmpty else { continue }
+            isLiveRefreshing = true
+            await refreshContainers(updateLastCommand: false, updateLastRunning: false)
+            if !Task.isCancelled { await refreshImages(updateLastCommand: false) }
+            if !Task.isCancelled { await refreshVolumes(updateLastCommand: false) }
+            if !Task.isCancelled { await refreshNetworks(updateLastCommand: false) }
+            isLiveRefreshing = false
+        }
+    }
+
     func refreshAll() async {
         isLoading = true
         defer { isLoading = false }
@@ -286,7 +298,7 @@ final class ContainerViewModel {
     }
 
     func startAllServices() async {
-        _ = await ensureSystemStarted()
+        if await ensureSystemStarted() { await DockerSocketService.shared.start() }
         await updateServiceStatus()
     }
 
@@ -330,19 +342,6 @@ final class ContainerViewModel {
         }
     }
 
-    private func mergedEnvironment(from base: [String: String]?) -> [String: String] {
-        var env = base ?? ProcessInfo.processInfo.environment
-        let defaultPath = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-        if let existing = env["PATH"], !existing.isEmpty {
-            if !existing.contains("/usr/local/bin") && !existing.contains("/opt/homebrew/bin") {
-                env["PATH"] = existing + ":" + defaultPath
-            }
-        } else {
-            env["PATH"] = defaultPath
-        }
-        return env
-    }
-
     private func ensureSystemStarted() async -> Bool {
         let first = await ContainerCLI.shared.run(["system", "start"])
         lastCommand = "container system start"
@@ -377,8 +376,7 @@ final class ContainerViewModel {
         let maxAttempts = max(1, timeoutSeconds * 2)
         for _ in 0..<maxAttempts {
             let status = await ContainerCLI.shared.run(["system", "status"])
-            let text = (status.stdout + "\n" + status.stderr).lowercased()
-            if text.contains("status             running") || text.contains("apiserver is running") {
+            if ContainerSystemStatus.isRunning(stdout: status.stdout, stderr: status.stderr, exitCode: status.exitCode) {
                 isServiceRunning = true
                 return true
             }
@@ -390,509 +388,15 @@ final class ContainerViewModel {
 
     private func updateServiceStatus() async {
         let status = await ContainerCLI.shared.run(["system", "status"])
-        let text = (status.stdout + "\n" + status.stderr).lowercased()
-        isServiceRunning = text.contains("status             running") || text.contains("apiserver is running")
+        isServiceRunning = ContainerSystemStatus.isRunning(stdout: status.stdout, stderr: status.stderr, exitCode: status.exitCode)
     }
 
     func stopAllServices() async {
+        await DockerSocketService.shared.stop()
         await runSimpleCommand(args: ["system", "stop"], label: "container system stop")
         lastOutput = [lastOutput, "Service stopped."].filter { !$0.isEmpty }.joined(separator: "\n")
         appendLog(command: lastCommand, output: lastOutput, error: lastRawError)
         await updateServiceStatus()
-    }
-
-    func installContainerViaHomebrew() async {
-        if isContainerAvailable() {
-            await configureKernelIfNeeded()
-            return
-        }
-        guard let brewURL = brewExecutableURL() else {
-            showHomebrewPrompt = true
-            lastError = "Homebrew is not installed. Please install Homebrew and try again."
-            return
-        }
-
-        isInstallingContainer = true
-        showInstallStatus = true
-        defer {
-            isInstallingContainer = false
-        }
-
-        var brewEnv = ProcessInfo.processInfo.environment
-        brewEnv["HOMEBREW_NO_INSTALL_CLEANUP"] = "1"
-        brewEnv["HOMEBREW_NO_ENV_HINTS"] = "1"
-        brewEnv["HOMEBREW_NO_AUTO_UPDATE"] = "1"
-
-        let zstdOk = await ensureZstdInstalled(executableURL: brewURL, environment: brewEnv)
-        if !zstdOk {
-            lastError = "zstd could not be installed. Please run in Terminal: brew install zstd"
-            return
-        }
-
-        let installResult = await runBrewInstall(executableURL: brewURL, environment: brewEnv)
-        lastCommand = "brew install container"
-        lastOutput = installResult.stdout
-        lastRawError = installResult.stderr
-        lastError = userFacingError(for: installResult)
-        appendLog(command: lastCommand, output: lastOutput, error: lastRawError)
-
-        let installOk = brewInstallSucceeded(installResult)
-            || brewOutputIndicatesCompletion(lastOutput, lastRawError)
-            || isContainerAvailable()
-        guard installOk else { return }
-        lastCommand = "container system start"
-        lastOutput = "Starting container system..."
-        lastRawError = ""
-        lastError = ""
-        let started = await ensureSystemStarted()
-        if !started {
-            lastError = "Container service could not be started. Please run manually: container system start"
-        }
-
-        lastCommand = "container system kernel set"
-        lastOutput = "Configuring kernel..."
-        lastRawError = ""
-        lastError = ""
-        await configureKernelIfNeeded()
-
-        await refreshAll()
-        showInstallStatus = false
-    }
-
-
-    private func ensureZstdInstalled(executableURL: URL, environment: [String: String]) async -> Bool {
-        let check = await runTool(executableURL: executableURL, arguments: ["list", "zstd"], label: "brew list zstd", environment: environment)
-        if check.exitCode == 0 { return true }
-
-        lastCommand = "brew install zstd"
-        lastOutput = "Installing zstd..."
-        lastRawError = ""
-        lastError = ""
-        appendLog(command: lastCommand, output: lastOutput, error: lastRawError)
-
-        let install = await runTool(executableURL: executableURL, arguments: ["install", "zstd"], label: "brew install zstd", environment: environment)
-        lastCommand = "brew install zstd"
-        lastOutput = install.stdout
-        lastRawError = install.stderr
-        lastError = userFacingError(for: install)
-        appendLog(command: lastCommand, output: lastOutput, error: lastRawError)
-
-        return install.exitCode == 0
-    }
-
-    private func runBrewInstall(executableURL: URL, environment: [String: String]) async -> CLIResult {
-        let process = Process()
-        process.executableURL = executableURL
-        process.arguments = ["install", "container"]
-        process.environment = environment
-
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
-
-        let stdoutBuffer = StreamBuffer()
-        let stderrBuffer = StreamBuffer()
-
-        let updateOutput: @MainActor (String) -> Void = { [weak self] text in
-            self?.lastOutput = text
-        }
-        let updateError: @MainActor (String) -> Void = { [weak self] text in
-            self?.lastRawError = text
-        }
-
-        stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
-            let data = handle.availableData
-            if !data.isEmpty {
-                Task {
-                    await stdoutBuffer.append(data)
-                    let text = String(data: await stdoutBuffer.snapshot(), encoding: .utf8) ?? ""
-                    await updateOutput(text)
-                }
-            }
-        }
-
-        stderrPipe.fileHandleForReading.readabilityHandler = { handle in
-            let data = handle.availableData
-            if !data.isEmpty {
-                Task {
-                    await stderrBuffer.append(data)
-                    let text = String(data: await stderrBuffer.snapshot(), encoding: .utf8) ?? ""
-                    await updateError(text)
-                }
-            }
-        }
-
-        do {
-            try process.run()
-        } catch {
-            return CLIResult(exitCode: -1, stdout: "", stderr: error.localizedDescription)
-        }
-
-        let startTime = Date()
-        while process.isRunning {
-            if isContainerAvailable() {
-                process.terminate()
-                break
-            }
-            let stdoutText = String(data: await stdoutBuffer.snapshot(), encoding: .utf8) ?? ""
-            let stderrText = String(data: await stderrBuffer.snapshot(), encoding: .utf8) ?? ""
-            if brewOutputIndicatesCompletion(stdoutText, stderrText) {
-                process.terminate()
-                break
-            }
-            if Date().timeIntervalSince(startTime) > 300 {
-                process.terminate()
-                break
-            }
-            try? await Task.sleep(nanoseconds: 1_000_000_000)
-        }
-
-        process.waitUntilExit()
-        stdoutPipe.fileHandleForReading.readabilityHandler = nil
-        stderrPipe.fileHandleForReading.readabilityHandler = nil
-
-        let stdout = String(data: await stdoutBuffer.snapshot(), encoding: .utf8) ?? ""
-        let stderr = String(data: await stderrBuffer.snapshot(), encoding: .utf8) ?? ""
-        return CLIResult(exitCode: process.terminationStatus, stdout: stdout, stderr: stderr)
-    }
-
-    private func brewInstallSucceeded(_ result: CLIResult) -> Bool {
-        if result.exitCode == 0 { return true }
-        let output = (result.stdout + "\n" + result.stderr).lowercased()
-        if output.contains("already installed") { return true }
-        if output.contains("summary") && output.contains("cellar") { return true }
-        if output.contains("post-install step did not complete successfully") { return true }
-        return false
-    }
-
-    private func brewOutputIndicatesCompletion(_ stdout: Data, _ stderr: Data) -> Bool {
-        let combined = (String(data: stdout, encoding: .utf8) ?? "") + "\n" + (String(data: stderr, encoding: .utf8) ?? "")
-        return brewOutputIndicatesCompletion(combined, "")
-    }
-
-    private func brewOutputIndicatesCompletion(_ stdout: String, _ stderr: String) -> Bool {
-        let combined = stdout + "\n" + stderr
-        let lower = combined.lowercased()
-        if lower.contains("post-install step did not complete successfully") { return true }
-        if lower.contains("already installed") { return true }
-        if lower.contains("summary") && lower.contains("cellar") { return true }
-        if lower.contains("warning:") && lower.contains("post-install") { return true }
-        return false
-    }
-
-    private func kernelSearchPaths() -> [String] {
-        guard let dirURL = kernelDownloadDirectoryURL() else { return [] }
-        if let items = try? FileManager.default.contentsOfDirectory(at: dirURL, includingPropertiesForKeys: nil) {
-            return items
-                .filter {
-                    let name = $0.lastPathComponent.lowercased()
-                    guard name.hasPrefix("vmlinux") else { return false }
-                    return !name.contains("experimental")
-                        && !name.contains("dragonball")
-                        && !name.contains("nvidia")
-                }
-                .map { $0.path }
-        }
-        return []
-    }
-
-    private func kernelSearchRoots() -> [String] {
-        guard let dirURL = kernelDownloadDirectoryURL() else { return [] }
-        return [dirURL.path]
-    }
-
-    private func kernelDownloadDirectoryURL() -> URL? {
-        guard let baseURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
-            return nil
-        }
-        let dirURL = baseURL.appendingPathComponent("AppleContainerGUI/kernels", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
-        return dirURL
-    }
-
-    private func saveKernelPath(_ path: String) {
-        UserDefaults.standard.set(path, forKey: "KernelBinaryPath")
-    }
-
-    private func loadKernelPath() -> String? {
-        let path = UserDefaults.standard.string(forKey: "KernelBinaryPath") ?? ""
-        guard !path.isEmpty else { return nil }
-        guard FileManager.default.fileExists(atPath: path) else { return nil }
-        let lower = path.lowercased()
-        if lower.contains("experimental") || lower.contains("dragonball") || lower.contains("nvidia") {
-            return nil
-        }
-        return path
-    }
-
-    private struct GitHubRelease: Decodable {
-        let tag_name: String
-        let assets: [GitHubAsset]
-    }
-
-    private struct GitHubAsset: Decodable {
-        let name: String
-        let browser_download_url: String
-    }
-
-    private func downloadDefaultKernel() async -> String? {
-        let apiURL = URL(string: "https://api.github.com/repos/kata-containers/kata-containers/releases/latest")
-        guard let apiURL else { return nil }
-
-        do {
-            let (data, _) = try await URLSession.shared.data(from: apiURL)
-            let release = try JSONDecoder().decode(GitHubRelease.self, from: data)
-            let asset = selectKernelAsset(from: release.assets)
-            guard let asset else {
-                lastRawError = "No suitable kernel asset found."
-                appendLog(command: "Download kernel", output: "", error: lastRawError)
-                return nil
-            }
-            if asset.name.hasSuffix(".tar.zst"), findZstdExecutable() == nil {
-                lastRawError = "zstd not found. Install zstd (brew install zstd) or provide a .tar.xz kernel asset."
-                lastError = "zstd is required to extract the kernel. Please install it with: brew install zstd"
-                appendLog(command: "Download kernel", output: "", error: lastRawError)
-                return nil
-            }
-            guard let downloadURL = URL(string: asset.browser_download_url) else {
-                lastRawError = "Invalid download URL for kernel asset."
-                appendLog(command: "Download kernel", output: "", error: lastRawError)
-                return nil
-            }
-
-            let (tempURL, _) = try await URLSession.shared.download(from: downloadURL)
-            guard let targetDir = kernelDownloadDirectoryURL() else {
-                lastRawError = "Kernel download directory not available."
-                appendLog(command: "Download kernel", output: "", error: lastRawError)
-                return nil
-            }
-            let archiveURL = targetDir.appendingPathComponent(asset.name)
-            try? FileManager.default.removeItem(at: archiveURL)
-            try FileManager.default.moveItem(at: tempURL, to: archiveURL)
-            appendLog(command: "Download kernel", output: "Saved: \(archiveURL.path)", error: "")
-
-            let extractedDir = targetDir.appendingPathComponent("kata_\(release.tag_name)", isDirectory: true)
-            try? FileManager.default.createDirectory(at: extractedDir, withIntermediateDirectories: true)
-
-            let extracted = await extractKernelArchive(archiveURL: archiveURL, destinationURL: extractedDir)
-            guard extracted else {
-                lastRawError = "Kernel archive extraction failed."
-                appendLog(command: "tar extract", output: "", error: lastRawError)
-                return nil
-            }
-
-            if let kernelPath = findKernelInDirectory(extractedDir) {
-                saveKernelPath(kernelPath)
-                appendLog(command: "Download kernel", output: "Kernel extracted: \(kernelPath)", error: "")
-                return kernelPath
-            }
-            lastRawError = "Kernel binary not found after extraction."
-            appendLog(command: "Download kernel", output: "", error: lastRawError)
-        } catch {
-            lastRawError = error.localizedDescription
-            appendLog(command: "Download kernel", output: "", error: lastRawError)
-        }
-
-        return nil
-    }
-
-    private func selectKernelAsset(from assets: [GitHubAsset]) -> GitHubAsset? {
-        let candidates = assets.filter {
-            let lower = $0.name.lowercased()
-            return lower.contains("arm64")
-                && lower.contains("kata-static")
-                && !lower.contains("experimental")
-                && !lower.contains("dragonball")
-                && !lower.contains("nvidia")
-        }
-        if let xz = candidates.first(where: { $0.name.hasSuffix(".tar.xz") }) { return xz }
-        if findZstdExecutable() == nil {
-            return nil
-        }
-        if let zst = candidates.first(where: { $0.name.hasSuffix(".tar.zst") }) { return zst }
-        return candidates.first
-    }
-
-    private func extractKernelArchive(archiveURL: URL, destinationURL: URL) async -> Bool {
-        let tarPath = "/usr/bin/tar"
-        let archive = archiveURL.path
-        let dest = destinationURL.path
-
-        if archive.hasSuffix(".tar.xz") {
-            let arguments = ["-xJf", archive, "-C", dest]
-            let result = await runTool(executableURL: URL(fileURLWithPath: tarPath), arguments: arguments, label: "tar extract")
-            let errorText = result.exitCode == 0 ? result.stderr : "exitCode=\(result.exitCode)\n\(result.stderr)"
-            appendLog(command: "tar extract", output: result.stdout, error: errorText)
-            return result.exitCode == 0
-        }
-
-        if archive.hasSuffix(".tar.zst") {
-            guard let zstd = findZstdExecutable() else { return false }
-            let tempTarURL = destinationURL.appendingPathComponent("kernel.tar")
-            try? FileManager.default.removeItem(at: tempTarURL)
-
-            let zstdArgs = ["-d", "-f", "-o", tempTarURL.path, archive]
-            let zstdResult = await runTool(executableURL: URL(fileURLWithPath: zstd), arguments: zstdArgs, label: "zstd decompress")
-            let zstdError = zstdResult.exitCode == 0 ? zstdResult.stderr : "exitCode=\(zstdResult.exitCode)\n\(zstdResult.stderr)"
-            appendLog(command: "zstd decompress", output: zstdResult.stdout, error: zstdError)
-            guard zstdResult.exitCode == 0 else { return false }
-
-            let tarArgs = ["-xf", tempTarURL.path, "-C", dest]
-            let tarResult = await runTool(executableURL: URL(fileURLWithPath: tarPath), arguments: tarArgs, label: "tar extract")
-            let tarError = tarResult.exitCode == 0 ? tarResult.stderr : "exitCode=\(tarResult.exitCode)\n\(tarResult.stderr)"
-            appendLog(command: "tar extract", output: tarResult.stdout, error: tarError)
-            return tarResult.exitCode == 0
-        }
-
-        return false
-    }
-
-    private func findZstdExecutable() -> String? {
-        let candidates = [
-            "/opt/homebrew/bin/zstd",
-            "/usr/local/bin/zstd"
-        ]
-        for path in candidates where FileManager.default.isExecutableFile(atPath: path) {
-            return path
-        }
-        return nil
-    }
-
-    private func findKernelInDirectory(_ dir: URL) -> String? {
-        var vmlinuxPath: String?
-
-        if let enumerator = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: nil) {
-            for case let fileURL as URL in enumerator {
-                let name = fileURL.lastPathComponent.lowercased()
-                if name.contains("experimental") || name.contains("dragonball") || name.contains("nvidia") {
-                    continue
-                }
-                if name.hasPrefix("vmlinux") {
-                    vmlinuxPath = fileURL.path
-                }
-            }
-        }
-
-        return vmlinuxPath
-    }
-
-    private func configureKernelIfNeeded() async {
-        var kernelPath = normalizeKernelPath(loadKernelPath() ?? findKernelBinaryPath())
-        if kernelPath == nil {
-            lastCommand = "Download kernel"
-            lastOutput = "Downloading default kernel..."
-            lastRawError = ""
-            lastError = ""
-            kernelPath = normalizeKernelPath(await downloadDefaultKernel())
-        }
-        guard let kernelPath else {
-            lastCommand = "container system kernel set"
-            lastOutput = ""
-            lastRawError = "Kernel binary not found"
-            lastError = "Kernel binary not found. Please run in Terminal: container system kernel set --binary /path/to/vmlinux"
-            appendLog(command: lastCommand, output: lastOutput, error: lastRawError)
-            return
-        }
-        saveKernelPath(kernelPath)
-
-        let help = await ContainerCLI.shared.run(["system", "kernel", "set", "--help"])
-        let helpText = (help.stdout + "\n" + help.stderr)
-        let supportsArch = helpText.contains("--arch")
-
-        var args = ["system", "kernel", "set", "--binary", kernelPath]
-        #if arch(arm64)
-        if supportsArch {
-            args.append(contentsOf: ["--arch", "arm64"])
-        }
-        #endif
-
-        let result = await ContainerCLI.shared.run(args)
-        lastCommand = "container system kernel set --binary \(kernelPath)"
-        lastOutput = result.stdout
-        lastRawError = result.stderr
-        if result.exitCode != 0 {
-            let lower = result.stderr.lowercased()
-            if lower.contains("file exists") || lower.contains("code=516") {
-                lastError = ""
-            } else {
-                lastError = "Kernel could not be configured automatically. Please run in Terminal: container system kernel set --binary /path/to/vmlinux\n\nRaw: \(result.stderr)"
-            }
-        } else {
-            lastError = ""
-        }
-        appendLog(command: lastCommand, output: lastOutput, error: lastRawError)
-
-        let status = await ContainerCLI.shared.run(["system", "status"])
-        appendLog(command: "container system status", output: status.stdout, error: status.stderr)
-    }
-
-    private func findKernelBinaryPath() -> String? {
-        let candidates = [
-            "/usr/local/share/container/vmlinux",
-            "/opt/homebrew/share/container/vmlinux",
-            "/usr/local/opt/container/share/container/vmlinux",
-            "/opt/homebrew/opt/container/share/container/vmlinux",
-            "/usr/local/share/kata-containers/vmlinux",
-            "/opt/homebrew/share/kata-containers/vmlinux"
-        ] + kernelSearchPaths()
-        let fileManager = FileManager.default
-        for path in candidates where fileManager.fileExists(atPath: path) {
-            let lower = (path as NSString).lastPathComponent.lowercased()
-            if lower.contains("experimental") || lower.contains("dragonball") || lower.contains("nvidia") {
-                continue
-            }
-            return path
-        }
-
-        let searchRoots = [
-            "/usr/local/share/container",
-            "/opt/homebrew/share/container",
-            "/usr/local/opt/container/share/container",
-            "/opt/homebrew/opt/container/share/container",
-            "/usr/local/share/kata-containers",
-            "/opt/homebrew/share/kata-containers",
-            "/usr/local/Cellar/container",
-            "/opt/homebrew/Cellar/container"
-        ] + kernelSearchRoots()
-
-        for root in searchRoots where fileManager.fileExists(atPath: root) {
-            if let enumerator = fileManager.enumerator(atPath: root) {
-                for case let item as String in enumerator {
-                    let name = (item as NSString).lastPathComponent.lowercased()
-                    if name.contains("experimental") || name.contains("dragonball") || name.contains("nvidia") {
-                        continue
-                    }
-                    if name.hasPrefix("vmlinux") {
-                        return (root as NSString).appendingPathComponent(item)
-                    }
-                }
-            }
-        }
-
-        return nil
-    }
-
-    private func normalizeKernelPath(_ path: String?) -> String? {
-        guard var path else { return nil }
-        let lower = (path as NSString).lastPathComponent.lowercased()
-        if lower.hasPrefix("vmlinuz") {
-            if let vmlinux = findSiblingVmlinux(for: path) {
-                path = vmlinux
-            } else {
-                return nil
-            }
-        }
-        return path
-    }
-
-    private func findSiblingVmlinux(for kernelPath: String) -> String? {
-        let dir = (kernelPath as NSString).deletingLastPathComponent
-        let vmlinuxPath = (dir as NSString).appendingPathComponent("vmlinux")
-        if FileManager.default.fileExists(atPath: vmlinuxPath) {
-            return vmlinuxPath
-        }
-        return nil
     }
 
     func pruneInactiveContainers() async {
@@ -901,29 +405,23 @@ final class ContainerViewModel {
         await cleanupEntrypointScripts(remainingContainers: containers)
     }
 
-    func recreateContainerWithResources(_ container: ContainerListItem, cpus: String, memory: String) async {
-        guard let reference = imageReference(for: container) else { return }
-        let config = buildRunConfig(from: container, cpus: cpus, memory: memory)
-        await runSimpleCommand(args: ["stop", container.name], label: "container stop \(container.name)")
-        await runSimpleCommand(args: ["delete", container.name], label: "container delete \(container.name)")
-        await runImage(reference: reference, config: config)
-    }
-
-    func currentResources(for container: ContainerListItem) -> (cpus: String, memory: String) {
-        guard case .object(let configuration) = container.raw["configuration"] else {
-            return ("", "")
-        }
-        guard case .object(let resources) = configuration["resources"] else {
-            return ("", "")
-        }
-        let cpusValue = numericString(from: resources["cpus"])
-        let memoryValue = memoryString(from: resources["memoryInBytes"])
-        return (cpusValue, memoryValue)
-    }
-
     func refreshContainers(updateLastCommand: Bool = true, updateLastRunning: Bool = true) async {
+        guard refreshingResources.insert("containers").inserted else { return }
+        defer { refreshingResources.remove("containers") }
         let handle: ([[String: JSONValue]]) -> Void = { [self] objects in
-            self.containers = objects.map { object in
+            let visible = objects.filter { object in
+                guard case .object(let configuration) = object["configuration"],
+                      case .object(let labels) = configuration["labels"] else { return true }
+                return labels["socktainer.role"] != .string("dns")
+            }.sorted { lhs, rhs in
+                @MainActor func key(_ value: [String: JSONValue]) -> String {
+                    if case .object(let config) = value["configuration"] { return config.stringValue(for: ["id", "name"]) ?? "" }
+                    return value.stringValue(for: ["id", "name"]) ?? ""
+                }
+                return key(lhs) < key(rhs)
+            }
+            guard self.containers.map(\.raw) != visible else { return }
+            self.containers = visible.map { object in
                 let configurationObject: [String: JSONValue]
                 if case .object(let config) = object["configuration"] {
                     configurationObject = config
@@ -947,7 +445,12 @@ final class ContainerViewModel {
                         ?? ""
                 }()
                 let ports = parsePorts(from: configurationObject)
-                let state = object.stringValue(for: ["state", "State", "status", "Status"]) ?? ""
+                let state: String
+                if case .object(let status) = object["status"] {
+                    state = status.stringValue(for: ["state", "State"]) ?? ""
+                } else {
+                    state = object.stringValue(for: ["state", "State", "status", "Status"]) ?? ""
+                }
                 return ContainerListItem(id: id, name: name, image: image, state: state, ports: ports, raw: object)
             }
         }
@@ -960,7 +463,7 @@ final class ContainerViewModel {
         )
 
         if success {
-            await cleanupEntrypointScripts(remainingContainers: containers)
+            if !isLiveRefreshing { await cleanupEntrypointScripts(remainingContainers: containers) }
             if updateLastRunning {
                 let running = containers
                     .filter { $0.state.lowercased().contains("running") }
@@ -971,12 +474,25 @@ final class ContainerViewModel {
     }
 
     func refreshImages(updateLastCommand: Bool = true) async {
+        guard refreshingResources.insert("images").inserted else { return }
+        defer { refreshingResources.remove("images") }
         let handle: ([[String: JSONValue]]) -> Void = { [self] objects in
-            self.images = objects.map { object in
-                let reference = object.stringValue(for: ["reference", "Reference", "name"]) ?? ""
+            let ordered = objects.sorted { lhs, rhs in
+                @MainActor func key(_ value: [String: JSONValue]) -> String {
+                    if case .object(let config) = value["configuration"] { return config.stringValue(for: ["name"]) ?? "" }
+                    return value.stringValue(for: ["reference", "name", "id"]) ?? ""
+                }
+                return key(lhs) < key(rhs)
+            }
+            guard self.images.map(\.raw) != ordered else { return }
+            self.images = ordered.map { object in
+                let configuration: [String: JSONValue]
+                if case .object(let value) = object["configuration"] { configuration = value } else { configuration = [:] }
+                let reference = configuration.stringValue(for: ["name", "reference"])
+                    ?? object.stringValue(for: ["reference", "Reference", "name"]) ?? ""
                 let digest = object.stringValue(for: ["digest", "Digest", "id", "ID"]) ?? UUID().uuidString
                 let size = imageSizeString(from: object)
-                return ImageListItem(id: digest, reference: reference, size: size, raw: object)
+                return ImageListItem(digest: digest, reference: reference, size: size, raw: object)
             }
         }
 
@@ -989,25 +505,32 @@ final class ContainerViewModel {
     }
 
     func refreshVolumes(updateLastCommand: Bool = true) async {
-        let handle: ([[String: JSONValue]]) -> Void = { [self] objects in
-            self.volumes = objects.map { object in
-                let name = object.stringValue(for: ["name", "Name", "id", "ID"]) ?? UUID().uuidString
-                let driver = object.stringValue(for: ["driver", "Driver"]) ?? ""
-                return VolumeListItem(id: name, name: name, driver: driver, raw: object)
+        guard refreshingResources.insert("volumes").inserted else { return }
+        defer { refreshingResources.remove("volumes") }
+        let bridge = DockerSocketService.shared
+        if !bridge.isRunning && !isLiveRefreshing { await bridge.start() }
+        guard bridge.isRunning else { if !isLiveRefreshing { lastError = bridge.lastError }; return }
+        do {
+            let response = try await DockerAPIClient(socketPath: bridge.socketPath).request(path: "/volumes")
+            let value = try JSONDecoder().decode(JSONValue.self, from: response.body)
+            guard case .object(let object) = value, case .array(let values) = object["Volumes"] else { return }
+            let refreshed: [VolumeListItem] = values.compactMap { value in
+                guard case .object(let raw) = value, let name = raw.stringValue(for: ["Name"]) else { return nil }
+                return VolumeListItem(id: name, name: name, driver: raw.stringValue(for: ["Driver"]) ?? "local", raw: raw)
             }
-        }
-
-        _ = await runListCommand(
-            args: ["volume", "list", "--format", "json"],
-            commandLabel: "container volume list --format json",
-            onSuccess: handle,
-            updateLastCommand: updateLastCommand
-        )
+            let ordered = refreshed.sorted { $0.name < $1.name }
+            if volumes != ordered { volumes = ordered }
+            if updateLastCommand { lastCommand = "docker volume ls"; lastError = "" }
+        } catch { if !isLiveRefreshing { lastError = error.localizedDescription } }
     }
 
     func refreshNetworks(updateLastCommand: Bool = true) async {
+        guard refreshingResources.insert("networks").inserted else { return }
+        defer { refreshingResources.remove("networks") }
         let handle: ([[String: JSONValue]]) -> Void = { [self] objects in
-            self.networks = objects.map { object in
+            let ordered = objects.sorted { ($0.stringValue(for: ["name", "id"]) ?? "") < ($1.stringValue(for: ["name", "id"]) ?? "") }
+            guard self.networks.map(\.raw) != ordered else { return }
+            self.networks = ordered.map { object in
                 let name = object.stringValue(for: ["name", "Name", "id", "ID"]) ?? UUID().uuidString
                 let driver = object.stringValue(for: ["driver", "Driver"]) ?? ""
                 return NetworkListItem(id: name, name: name, driver: driver, raw: object)
@@ -1036,11 +559,13 @@ final class ContainerViewModel {
 
     func deleteContainer(_ container: ContainerListItem) async {
         let target = container.name.isEmpty ? container.id : container.name
-        _ = await resolveEntrypointPath(for: container, target: target)
-        await runSimpleCommand(args: ["delete", target], label: "container delete \(target)")
-        await refreshContainers(updateLastCommand: false)
+        guard await deleteResource(.containers, name: target) else { return }
+        containers.removeAll { $0.id == container.id }
         await cleanupEntrypointScripts(remainingContainers: containers)
         removeAutostartContainer(named: target)
+        var running = loadLastRunningContainers()
+        running.remove(target)
+        saveLastRunningContainers(running)
     }
 
     private func startAutostartContainersIfNeeded() async {
@@ -1119,29 +644,15 @@ final class ContainerViewModel {
     }
 
     func deleteImage(_ image: ImageListItem) async {
-        await runSimpleCommand(args: ["image", "delete", image.reference], label: "container image delete \(image.reference)")
-        await refreshImages(updateLastCommand: false)
-    }
-
-    func isImageInUse(_ image: ImageListItem) -> Bool {
-        let ref = image.reference
-        return containers.contains { container in
-            container.image == ref
-        }
-    }
-
-    func reportImageInUseError(_ image: ImageListItem) {
-        lastCommand = "container image delete \(image.reference)"
-        lastOutput = ""
-        lastRawError = "Image is used by one or more containers and cannot be deleted."
-        lastError = lastRawError
-        appendLog(command: lastCommand, output: lastOutput, error: lastRawError)
+        let target = image.reference.isEmpty ? image.id : image.reference
+        guard await deleteResource(.images, name: target) else { return }
+        images.removeAll { $0.id == image.id && $0.reference == image.reference }
     }
 
     func updateImage(_ image: ImageListItem) async {
         let reference = image.reference.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !reference.isEmpty else { return }
-        let listDigest = imageListDigest(from: image.raw) ?? image.id
+        let listDigest = imageListDigest(from: image.raw) ?? image.digest
         await updateImageByReference(
             reference,
             localDigest: listDigest,
@@ -1574,8 +1085,8 @@ final class ContainerViewModel {
     }
 
     func deleteVolume(_ volume: VolumeListItem) async {
-        await runSimpleCommand(args: ["volume", "delete", volume.name], label: "container volume delete \(volume.name)")
-        await refreshVolumes(updateLastCommand: false)
+        guard await deleteResource(.volumes, name: volume.name) else { return }
+        volumes.removeAll { $0.id == volume.id }
     }
 
     func openVolumeInFinder(_ volume: VolumeListItem) async {
@@ -1585,9 +1096,9 @@ final class ContainerViewModel {
         } else {
             path = await fetchVolumeMountpoint(name: volume.name)
         }
-        if let path {
+        if let path, FileManager.default.fileExists(atPath: path) {
             lastCommand = "open volume \(volume.name)"
-            lastOutput = path
+            lastOutput = path + (path.hasSuffix(".img") ? "\nApple Container stores this volume as a Linux disk image. Finder shows the storage file; access its contents through the mounted path inside a container." : "")
             lastRawError = ""
             lastError = ""
             appendLog(command: lastCommand, output: lastOutput, error: lastRawError)
@@ -1608,6 +1119,15 @@ final class ContainerViewModel {
     }
 
     private func fixNamedVolumePermissions(volumeName: String, container: ContainerListItem) async {
+        let directory = ManagedRuntime.shared.storage.appendingPathComponent("Volumes").appendingPathComponent(volumeName)
+        if FileManager.default.fileExists(atPath: directory.appendingPathComponent("metadata.json").path) {
+            lastCommand = "volume ownership " + volumeName
+            lastOutput = "VirtioFS maps file ownership through macOS. Container chown cannot reliably change Linux UID/GID. Manage host access in Finder: " + directory.appendingPathComponent("data").path
+            lastRawError = ""
+            lastError = ""
+            appendLog(command: lastCommand, output: lastOutput, error: lastRawError)
+            return
+        }
         let target = container.name.isEmpty ? container.id : container.name
         let uidGid = await resolveUidGid(containerName: target)
         guard let uidGid else {
@@ -1711,35 +1231,18 @@ final class ContainerViewModel {
     }
 
     private func fetchVolumeMountpoint(name: String) async -> String? {
-        let result = await ContainerCLI.shared.run(["volume", "inspect", name, "--format", "json"])
-        guard result.exitCode == 0,
-              let data = result.stdout.data(using: .utf8),
-              let decoded = try? JSONDecoder().decode([JSONValue].self, from: data) else { return nil }
-        let objects = decoded.compactMap { value -> [String: JSONValue]? in
-            if case .object(let object) = value { return object }
-            return nil
-        }
-        for object in objects {
-            if let path = resolveVolumeMountpoint(from: object) {
-                return path
-            }
-        }
-        return nil
+        let result = await DockerSocketService.shared.runDocker(["volume", "inspect", name])
+        guard result.code == 0, let values = try? JSONDecoder().decode([JSONValue].self, from: Data(result.output.utf8)), case .object(let raw) = values.first else { return nil }
+        return resolveVolumeMountpoint(from: raw)
     }
 
     private func resolveVolumeMountpoint(from raw: [String: JSONValue]) -> String? {
-        if let path = raw.stringValue(for: ["mountpoint", "Mountpoint", "path", "Path"]) {
+        if let path = raw.stringValue(for: ["mountpoint", "Mountpoint", "path", "Path", "source", "Source"]), !path.isEmpty {
             return path
         }
-        if let source = raw.stringValue(for: ["source", "Source"]) {
-            return URL(fileURLWithPath: source).deletingLastPathComponent().path
-        }
-        if case .object(let config) = raw["config"] ?? raw["Config"] {
-            if let path = config.stringValue(for: ["mountpoint", "Mountpoint", "path", "Path"]) {
+        for key in ["configuration", "Configuration", "config", "Config"] {
+            if case .object(let config) = raw[key], let path = resolveVolumeMountpoint(from: config) {
                 return path
-            }
-            if let source = config.stringValue(for: ["source", "Source"]) {
-                return URL(fileURLWithPath: source).deletingLastPathComponent().path
             }
         }
         return nil
@@ -1829,8 +1332,62 @@ final class ContainerViewModel {
     }
 
     func deleteNetwork(_ network: NetworkListItem) async {
-        await runSimpleCommand(args: ["network", "delete", network.name], label: "container network delete \(network.name)")
-        await refreshNetworks(updateLastCommand: false)
+        guard await deleteResource(.networks, name: network.name) else { return }
+        networks.removeAll { $0.id == network.id }
+    }
+
+    var isDeletingResource = false
+
+    private func deleteResource(_ resource: DockerAPIClient.Resource, name: String) async -> Bool {
+        guard !isDeletingResource else { return false }
+        isDeletingResource = true
+        defer { isDeletingResource = false }
+        lastCommand = "delete " + resource.rawValue + " " + name
+        lastOutput = resource == .containers ? "Stopping and removing container..." : "Removing resource..."
+        lastRawError = ""
+        lastError = ""
+        do {
+            let bridge = DockerSocketService.shared
+            if !bridge.isRunning { await bridge.start() }
+            guard bridge.isRunning else { throw DockerAPIError(message: bridge.lastError) }
+            var removed = try await DockerAPIClient(socketPath: bridge.socketPath).remove(resource, name: name)
+            if !removed, resource != .volumes {
+                removed = try await removeNativeEntry(resource, name: name)
+            }
+            lastOutput = removed ? "Removed " + name + "." : "Already absent in the backend. Removed the stale entry for " + name + "."
+            appendLog(command: lastCommand, output: lastOutput, error: "")
+            return true
+        } catch {
+            lastOutput = ""
+            lastRawError = error.localizedDescription
+            lastError = lastRawError
+            appendLog(command: lastCommand, output: "", error: lastRawError)
+            return false
+        }
+    }
+
+    private func removeNativeEntry(_ resource: DockerAPIClient.Resource, name: String) async throws -> Bool {
+        let prefix: [String]
+        switch resource {
+        case .containers: prefix = []
+        case .images: prefix = ["image"]
+        case .networks: prefix = ["network"]
+        case .volumes: return false
+        }
+        let arguments = prefix + ["delete"] + (resource == .containers ? ["--force"] : []) + [name]
+        let result = await ContainerCLI.shared.run(arguments)
+        if result.exitCode == 0 { return true }
+        let listArguments = prefix + ["list"] + (resource == .containers ? ["--all"] : []) + ["--format", "json"]
+        let list = await ContainerCLI.shared.run(listArguments)
+        guard list.exitCode == 0, let objects = await Self.decodeJSONObjectArray(list.stdout) else {
+            throw DockerAPIError(message: result.stderr + "\n" + list.stderr)
+        }
+        let stillPresent = objects.contains { object in
+            if resource == .containers, case .object(let config) = object["configuration"], config.stringValue(for: ["id", "name"]) == name { return true }
+            return ["id", "name", "reference", "digest"].contains { object.stringValue(for: [$0]) == name }
+        }
+        guard !stillPresent else { throw DockerAPIError(message: result.stderr) }
+        return false
     }
 
     func refreshSnapshots() {
@@ -1868,7 +1425,8 @@ final class ContainerViewModel {
 
     func deleteSnapshot(_ snapshot: SnapshotItem) {
         do {
-            try FileManager.default.removeItem(atPath: snapshot.path)
+            do { try FileManager.default.removeItem(atPath: snapshot.path) }
+            catch let error as NSError where error.domain == NSCocoaErrorDomain && [NSFileNoSuchFileError, NSFileReadNoSuchFileError].contains(error.code) {}
             lastCommand = "delete snapshot \(snapshot.name)"
             lastOutput = "Snapshot deleted."
             lastRawError = ""
@@ -1886,13 +1444,16 @@ final class ContainerViewModel {
 
     func deleteAllSnapshots() {
         let current = snapshots
+        var failures: [String] = []
         for snapshot in current {
-            try? FileManager.default.removeItem(atPath: snapshot.path)
+            do { try FileManager.default.removeItem(atPath: snapshot.path) }
+            catch let error as NSError where error.domain == NSCocoaErrorDomain && [NSFileNoSuchFileError, NSFileReadNoSuchFileError].contains(error.code) {}
+            catch { failures.append(snapshot.name + ": " + error.localizedDescription) }
         }
         lastCommand = "delete all snapshots"
-        lastOutput = "Snapshots deleted."
-        lastRawError = ""
-        lastError = ""
+        lastOutput = "Removed \(current.count - failures.count) snapshot entries."
+        lastRawError = failures.joined(separator: "\n")
+        lastError = lastRawError
         appendLog(command: lastCommand, output: lastOutput, error: lastRawError)
         refreshSnapshots()
     }
@@ -2002,7 +1563,7 @@ final class ContainerViewModel {
             let value = envVar.value
             args.append(contentsOf: ["-e", "\(key)=\(value)"])
         }
-        let extraArgs = splitArguments(config.extraArgs)
+        let extraArgs = DockerSocketService.shared.isRunning ? splitArgumentsRaw(config.extraArgs) : splitArguments(config.extraArgs)
         if !extraArgs.isEmpty {
             args.append(contentsOf: extraArgs)
         }
@@ -2053,8 +1614,52 @@ final class ContainerViewModel {
         return String(String.UnicodeScalarView(filteredScalars))
     }
 
+    private func runDockerCommand(_ arguments: [String]) async {
+        guard !isRunningCommand else { return }
+        guard let first = arguments.first, !first.hasPrefix("-") else {
+            lastError = "Use docker followed by a command. The app supplies its own Docker host."
+            return
+        }
+        guard DockerSocketService.dockerExecutable() != nil else {
+            lastError = "Docker CLI was not found. Install the Docker CLI to run Docker commands."
+            return
+        }
+        let bridge = DockerSocketService.shared
+        if !bridge.isRunning { await bridge.start() }
+        guard bridge.isRunning else {
+            lastError = bridge.lastError
+            return
+        }
+        isRunningCommand = true
+        defer { isRunningCommand = false; commandStatusText = "" }
+        commandStatusText = "Running through the Docker API socket"
+        lastCommand = "docker " + arguments.map(DockerSocketService.shellQuote).joined(separator: " ")
+        lastOutput = ""
+        lastError = ""
+        lastRawError = ""
+        let result = await bridge.runDocker(arguments)
+        lastOutput = result.output
+        lastRawError = result.error
+        lastError = result.code == 0 ? "" : (result.error.isEmpty ? "Docker command exited with code \(result.code)" : result.error)
+        appendLog(command: lastCommand, output: lastOutput, error: lastRawError)
+        await refreshContainers(updateLastCommand: false)
+        await refreshImages(updateLastCommand: false)
+    }
+
     func runCustomCommand(_ rawArguments: String, overrideEntrypoint: Bool = false, customEntrypointPath: String = "") async {
         let rawArgs = splitArgumentsRaw(rawArguments)
+        if rawArgs.first == "docker" {
+            await runDockerCommand(Array(rawArgs.dropFirst()))
+            return
+        }
+        if let first = rawArgs.first, !["container", "system", "snapshot"].contains(first) {
+            await runDockerCommand(rawArgs)
+            return
+        }
+        if rawArgs.first == "container", rawArgs.count > 1, ["run", "create", "volume"].contains(rawArgs[1]) {
+            lastError = "Use Docker commands for containers and volumes so data mounts use VirtioFS."
+            return
+        }
         let restartPolicy = extractRestartPolicy(from: rawArgs)?.lowercased()
         var args = splitArguments(rawArguments)
         guard !args.isEmpty else { return }
@@ -2210,41 +1815,35 @@ final class ContainerViewModel {
         return true
     }
 
+    private func dockerArguments(for arguments: [String]) -> [String]? {
+        guard let first = arguments.first else { return nil }
+        if ["run", "start", "stop", "exec", "kill", "inspect", "logs"].contains(first) { return arguments }
+        if first == "delete" { return ["rm"] + arguments.dropFirst() }
+        if ["image", "volume", "network"].contains(first), arguments.count >= 2 {
+            var mapped = arguments
+            if mapped[1] == "delete" { mapped[1] = "rm" }
+            if ["rm", "create", "inspect", "pull"].contains(mapped[1]) { return mapped }
+        }
+        return nil
+    }
+
     private func runSimpleCommand(args: [String], label: String) async {
-        let result = await ContainerCLI.shared.run(args)
-        lastCommand = label
+        let result: CLIResult
+        var commandLabel = label
+        if let dockerArgs = dockerArguments(for: args) {
+            if !DockerSocketService.shared.isRunning { await DockerSocketService.shared.start() }
+            guard DockerSocketService.shared.isRunning else { lastError = DockerSocketService.shared.lastError; return }
+            let output = await DockerSocketService.shared.runDocker(dockerArgs)
+            result = CLIResult(exitCode: output.code, stdout: output.output, stderr: output.error)
+            commandLabel = "docker " + dockerArgs.map(DockerSocketService.shellQuote).joined(separator: " ")
+        } else {
+            result = await ContainerCLI.shared.run(args)
+        }
+        lastCommand = commandLabel
         lastOutput = Self.prettyPrintedJSONIfPossible(result.stdout)
         lastRawError = result.stderr
         lastError = userFacingError(for: result)
-        appendLog(command: label, output: lastOutput, error: result.stderr)
-    }
-
-    private func runTool(executableURL: URL, arguments: [String], label: String, environment: [String: String]? = nil) async -> CLIResult {
-        let process = Process()
-        process.executableURL = executableURL
-        process.arguments = arguments
-        process.environment = mergedEnvironment(from: environment)
-
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
-
-        do {
-            try process.run()
-        } catch {
-            return CLIResult(exitCode: -1, stdout: "", stderr: error.localizedDescription)
-        }
-
-        return await withCheckedContinuation { continuation in
-            process.terminationHandler = { process in
-                let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-                let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-                let stdout = String(data: stdoutData, encoding: .utf8) ?? ""
-                let stderr = String(data: stderrData, encoding: .utf8) ?? ""
-                continuation.resume(returning: CLIResult(exitCode: process.terminationStatus, stdout: stdout, stderr: stderr))
-            }
-        }
+        appendLog(command: commandLabel, output: lastOutput, error: result.stderr)
     }
 
     private func userFacingError(for result: CLIResult) -> String {
@@ -2259,14 +1858,12 @@ final class ContainerViewModel {
             return "Container service is not running or not reachable. Start it with: container system start.\n\nRaw: \(stderr)"
         }
         if lower.contains("no such file or directory") && lower.contains("container") {
-            return "Container CLI was not found. Check the install path (e.g. /usr/local/bin/container).\n\nRaw: \(stderr)"
+            return "Container CLI was not found. Use Install Runtime in the app.\n\nRaw: \(stderr)"
         }
         if lower.contains("notfound") && lower.contains("content with digest") {
             return "The local image store is inconsistent. Stop the service and reset the store, then pull again.\n\nRaw: \(stderr)"
         }
-        if lower.contains("brew") && lower.contains("permission") {
-            return "Homebrew needs permissions to install. Run the installation in Terminal.\n\nRaw: \(stderr)"
-        }
+
 
         return stderr.isEmpty ? "Unknown error (exit code \(result.exitCode))." : stderr
     }
@@ -2307,8 +1904,7 @@ final class ContainerViewModel {
             process.executableURL = resolved
             process.arguments = args
         } else {
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-            process.arguments = ["container"] + args
+            return CLIResult(exitCode: -1, stdout: "", stderr: "Install the bundled runtime in the app first.")
         }
         process.environment = ContainerCLI.defaultEnvironment()
 
@@ -2371,18 +1967,6 @@ final class ContainerViewModel {
 
     private func isContainerAvailable() -> Bool {
         ContainerCLI.containerExecutableURL() != nil
-    }
-
-    private func brewExecutableURL() -> URL? {
-        let candidates = [
-            "/opt/homebrew/bin/brew",
-            "/usr/local/bin/brew"
-        ]
-        let fileManager = FileManager.default
-        for path in candidates where fileManager.isExecutableFile(atPath: path) {
-            return URL(fileURLWithPath: path)
-        }
-        return nil
     }
 
     private func splitArguments(_ input: String) -> [String] {
@@ -2949,7 +2533,7 @@ final class ContainerViewModel {
             let containerPort = portValueString(from: portObject["containerPort"])
             let hostAddress = portObject.stringValue(for: ["hostAddress"]) ?? ""
             return ContainerPortMapping(
-                id: UUID(),
+                id: "\(hostAddress):\(hostPort):\(containerPort):\(portObject.stringValue(for: ["proto"]) ?? "tcp")",
                 hostPort: hostPort,
                 containerPort: containerPort,
                 hostAddress: hostAddress
@@ -2958,18 +2542,17 @@ final class ContainerViewModel {
     }
 
     private func imageSizeString(from object: [String: JSONValue]) -> String {
-        if let text = object.stringValue(for: ["size", "Size", "fullSize", "full_size", "FullSize", "full_size_bytes"]),
-           !text.isEmpty {
-            return text
+        if case .array(let variants) = object["variants"] {
+            let sizes = variants.compactMap { value -> Double? in
+                guard case .object(let variant) = value, case .number(let size) = variant["size"] else { return nil }
+                return size
+            }
+            if !sizes.isEmpty { return formatBytes(sizes.reduce(0, +)) }
         }
-        if let sizeValue = object["size"] ?? object["Size"] ?? object["fullSize"] ?? object["full_size"] {
-            switch sizeValue {
-            case .number(let number):
-                return formatBytes(number)
-            case .string(let string):
-                return string
-            default:
-                break
+        for key in ["size", "Size", "fullSize", "full_size", "FullSize", "full_size_bytes"] {
+            if case .number(let size) = object[key] { return formatBytes(size) }
+            if case .string(let value) = object[key], !value.isEmpty {
+                return Double(value).map { formatBytes($0) } ?? value
             }
         }
         return ""
@@ -3017,30 +2600,6 @@ final class ContainerViewModel {
             return imageObject.stringValue(for: ["reference", "name", "image", "Image"])
         }
         return configuration.stringValue(for: ["image", "Image"])
-    }
-
-    private func buildRunConfig(from container: ContainerListItem, cpus: String, memory: String) -> RunImageConfig {
-        let ports = container.ports.map { mapping in
-            RunPortMapping(id: UUID(), hostPort: mapping.hostPort, containerPort: mapping.containerPort)
-        }
-        let volumes = parseVolumes(from: container.raw)
-        let environment = parseEnvironment(from: container.raw)
-        let command = parseCommand(from: container.raw)
-        let entrypointOverride = extractEntrypointOverride(from: container.raw)
-
-        return RunImageConfig(
-            name: container.name,
-            detach: true,
-            cpus: cpus,
-            memory: memory,
-            overrideEntrypoint: entrypointOverride.isEnabled,
-            customEntrypointPath: entrypointOverride.customPath,
-            ports: ports,
-            volumes: volumes,
-            environment: environment,
-            command: command,
-            extraArgs: ""
-        )
     }
 
     private func parseVolumes(from raw: [String: JSONValue]) -> [RunVolumeMapping] {

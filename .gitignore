@@ -12,3 +12,9 @@ build/
 
 # Swift Package Manager
 .build/
+**/xcuserdata/
+
+__pycache__/
+*.pyc
+
+LocalDevelopment/

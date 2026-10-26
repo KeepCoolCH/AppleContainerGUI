@@ -10,72 +10,27 @@ actor ContainerCLI {
     static let shared = ContainerCLI()
 
     func run(_ arguments: [String]) async -> CLIResult {
-        let process = Process()
-        let resolved = Self.containerExecutableURL()
-        if let resolved {
-            process.executableURL = resolved
-            process.arguments = arguments
-        } else {
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-            process.arguments = ["container"] + arguments
+        guard let executable = Self.containerExecutableURL(), let root = ManagedRuntime.shared.installedRoot else {
+            return CLIResult(exitCode: -1, stdout: "", stderr: "Install the bundled runtime using Install Runtime in the app.")
         }
-        process.environment = Self.mergedEnvironment()
-
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
-
-        do {
-            try process.run()
-        } catch {
-            return CLIResult(exitCode: -1, stdout: "", stderr: error.localizedDescription)
+        if arguments == ["system", "start"] {
+            do {
+                try await ManagedRuntime.shared.start(root)
+                return CLIResult(exitCode: 0, stdout: "Bundled Apple Container is running", stderr: "")
+            } catch { return CLIResult(exitCode: -1, stdout: "", stderr: error.localizedDescription) }
         }
-
-        return await withCheckedContinuation { continuation in
-            process.terminationHandler = { process in
-                let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-                let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-                let stdout = String(data: stdoutData, encoding: .utf8) ?? ""
-                let stderr = String(data: stderrData, encoding: .utf8) ?? ""
-                continuation.resume(returning: CLIResult(exitCode: process.terminationStatus, stdout: stdout, stderr: stderr))
-            }
-        }
-    }
-
-    private static func resolveContainerExecutable() -> URL? {
-        let candidates = [
-            "/opt/homebrew/bin/container",
-            "/usr/local/bin/container",
-            "/usr/bin/container"
-        ]
-        let fileManager = FileManager.default
-        for path in candidates where fileManager.isExecutableFile(atPath: path) {
-            return URL(fileURLWithPath: path)
-        }
-        return nil
+        let result = await LocalCommand.run(executable, arguments, environment: Self.defaultEnvironment(), timeout: 120)
+        return CLIResult(exitCode: result.code, stdout: result.output, stderr: result.error)
     }
 
     static func containerExecutableURL() -> URL? {
-        resolveContainerExecutable()
+        ManagedRuntime.shared.executable("AppleContainer/bin/container")
     }
 
     static func defaultEnvironment() -> [String: String] {
-        mergedEnvironment()
+        ManagedRuntime.shared.environment()
     }
 
-    private static func mergedEnvironment() -> [String: String] {
-        var env = ProcessInfo.processInfo.environment
-        let defaultPath = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-        if let existing = env["PATH"], !existing.isEmpty {
-            if !existing.contains("/usr/local/bin") && !existing.contains("/opt/homebrew/bin") {
-                env["PATH"] = existing + ":" + defaultPath
-            }
-        } else {
-            env["PATH"] = defaultPath
-        }
-        return env
-    }
 }
 
 enum JSONValue: Codable, Hashable {
